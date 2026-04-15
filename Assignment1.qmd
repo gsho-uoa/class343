@@ -1,0 +1,518 @@
+---
+title: "The Slow Return: Tracking the Recovery of Auckland's Foot Traffic"
+subtitle: "Analysing Auckland CBD's pedestrian data from 2020-2024"
+author: "Georgia Short"
+format:
+  pdf:
+    toc: false
+    number-sections: false
+    geometry: margin=2.5cm
+---
+
+```{python}
+#| eval: True
+
+#=========================
+#     IMPORT PACKAGES
+#=========================
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+import requests
+import time
+import zipfile
+import io
+import geopandas as gpd
+import folium
+import branca.colormap as cm
+
+#=========================
+#     BUILD FUNCTIONS
+#=========================
+#First function
+def count_missing(df):
+    """
+    Count missing values in each column of a DataFrame.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        The input dataset.
+
+    Returns
+    -------
+    pandas.Series
+        Number of missing values per column.
+    """
+    return df.isnull().sum()
+
+#Second function
+def footfall_level(count):
+    """
+    Categorise footfall into low, medium, or high levels.
+
+    Parameters
+    ----------
+    count : int or float
+        Footfall count for a given observation.
+
+    Returns
+    -------
+    str
+        Category label: 'Low', 'Medium', or 'High'.
+    """
+    if count < 300:
+        return "Low"
+    elif count < 1000:
+        return "Medium"
+    else:
+        return "High"
+
+#Third function
+def compute_recovery(df, base_year="2020", compare_year="2024"):
+    """
+    Compute percentage recovery between two years for each sensor or SA2.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Wide-format DataFrame with year columns (e.g., '2020', '2024').
+    base_year : str
+        The reference year for comparison.
+    compare_year : str
+        The year to compare against the base year.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Original DataFrame with an added 'pct_recovery' column.
+    """
+    df = df.copy()
+    df["pct_recovery"] = (
+        (df[compare_year] - df[base_year]) / df[base_year] * 100
+    )
+    return df
+
+#=========================
+#       DATA IMPORT 
+#=========================
+files = [                   #Assign all csv's to analyise to one name
+    'akl_ped-2020.csv',
+    'akl_ped-2021.csv',
+    'akl_ped-2022.csv',
+    'akl_ped-2023.csv',
+    'akl_ped-2024.csv'
+]
+df = [pd.read_csv(f) for f in files] #Read csv files into dataframe
+ped = pd.concat(df, ignore_index=True) #Combine into one datafrane
+
+sensor_locations = pd.read_csv("akl_ped-Geodata.csv")
+
+```
+
+
+```{python}
+#| eval: False
+
+#Explore the structure
+print(ped.shape) #Look at the shape of the data
+count_missing(ped)  #Identify missing values using function 1
+ped.info()
+ped.head() #Check data has loaded correctly
+ped.tail()
+ped.describe()
+
+```
+```{python}
+#| eval: True
+
+#=========================
+#      DATA CLEANING 
+#=========================
+# Clean non-data rows first, then convert Date to datetime
+ped = ped.dropna(subset=['Date', 'Time']) 
+ped = ped[ped['Date'] != 'Daylight Savings']
+# Ensure Date is datetime
+ped['Date'] = pd.to_datetime(ped['Date'], format = 'mixed')
+# Extract useful temporal features
+ped["month"] = ped["Date"].dt.month #Month
+ped["day_of_week"] = pd.to_datetime(ped["Date"]).dt.day_name() #Day of week
+ped["hour"] = ped["Time"].str.split(":").str[0].astype(int) #Hour
+
+ped = ped.rename(columns={"59 High Stret": "59 High Street"}) #Correct errors in names
+ped = ped.drop(columns=[ #Removed theses sensors data due to being unavailable during some of the time period
+    "188 Quay Street Lower Albert (EW)", 
+    "188 Quay Street Lower Albert (NS)",
+    "107 Quay Street"]
+    ) 
+#Fix object to interger
+# Convert all sensor columns to numeric (fixes 150 K Road)
+sensor_cols = [
+    c for c in ped.columns 
+    if c not in ["Date", "Time", "month", "day_of_week", "hour"]
+]
+
+ped[sensor_cols] = ped[sensor_cols].apply(
+    pd.to_numeric, errors="coerce"
+)
+ped.dtypes #check if fix worked
+count_missing(ped) # Check for missing values across the entire DataFrame
+
+ped_interp = ped.copy()
+ped_interp[sensor_cols] = ped_interp[sensor_cols].interpolate(method="linear") #Fill missing values with a mean using interpolate
+ped_interp.describe()
+count_missing(ped_interp)
+ped_long = ped_interp.melt(    #Convert wide to long format
+    id_vars=["Date", "Time", "month", "day_of_week", "hour"],
+    value_vars=sensor_cols,
+    var_name='Location',
+    value_name='Count'
+)
+print(ped_long.head(10))
+print(f"\nWide shape: {ped.shape}")
+print(f"Long shape: {ped_long.shape}")
+count_missing(ped_long)
+
+ped_long["year"] = ped_long["Date"].dt.year
+yearly = (
+    ped_long
+    .groupby("year")["Count"]
+    .sum()
+    .reset_index()
+)
+ped_long["year"] = ped_long["Date"].dt.year
+print(yearly)
+#Fix wrong year
+mask_2017 = ped_long["Date"].dt.year == 2017
+ped_long.loc[mask_2017, "Date"] = ped_long.loc[mask_2017, "Date"].apply(
+    lambda d: d.replace(year=2020)
+)
+ped_long["year"] = ped_long["Date"].dt.year
+yearly = (
+    ped_long
+    .groupby("year")["Count"]
+    .sum()
+    .reset_index()
+)
+
+print(yearly)
+
+```
+
+
+```{python}
+#| eval: True
+
+#=========================
+#     API INTEGRATION 
+#=========================
+
+from config import API_KEY 
+
+LAYER_ID = 111227   # SA2 2023 layer
+BASE_URL = "https://datafinder.stats.govt.nz/services/api/v1.x"
+
+HEADERS = {
+    "Authorization": f"key {API_KEY}",
+    "Content-Type": "application/json",
+}
+
+payload = {
+    "crs": "EPSG:2193",   # Stats NZ default (NZTM)
+    "formats": {"vector": "application/x-ogc-gpkg"},
+    "items": [{"item": f"{BASE_URL}/layers/{LAYER_ID}/"}],
+}
+
+response = requests.post(f"{BASE_URL}/exports/", json=payload, headers=HEADERS)
+response.raise_for_status()
+
+export_data = response.json()
+export_url = export_data["url"]
+
+print("Export job created:", export_url)
+print("Initial state:", export_data["state"])
+
+while True:
+    status = requests.get(export_url, headers=HEADERS).json()
+    state = status["state"]
+    print("Export state:", state)
+
+    if state == "complete":
+        download_url = status["download_url"]
+        break
+    elif state == "failed":
+        raise RuntimeError("Export failed.")
+
+    time.sleep(2)
+
+zip_path = "sa2_2023.zip"
+dl = requests.get(download_url, headers=HEADERS, stream=True)
+dl.raise_for_status()
+
+with open(zip_path, "wb") as f:
+    for chunk in dl.iter_content(chunk_size=8192):
+        f.write(chunk)
+
+print("ZIP downloaded:", zip_path)
+
+extract_folder = "sa2_2023/"
+with zipfile.ZipFile(zip_path) as zf:
+    gpkg_name = [n for n in zf.namelist() if n.endswith(".gpkg")][0]
+    zf.extractall(extract_folder)
+
+print("Extracted:", gpkg_name)
+
+sa2_2023 = gpd.read_file(f"{extract_folder}{gpkg_name}")
+print("Original CRS:", sa2_2023.crs)
+print(sa2_2023.shape)
+
+sa2_2023_4326 = sa2_2023.to_crs("EPSG:4326")
+print("Reprojected CRS:", sa2_2023_4326.crs)
+
+output_path = "sa2_2023_4326.gpkg"
+sa2_2023_4326.to_file(output_path, driver="GPKG")
+
+print("Saved:", output_path)
+```
+
+```{python} 
+#| echo: false
+
+# Compute monthly totals by year
+monthly_year = (
+    ped_long
+    .groupby(["year", "month"])["Count"]
+    .sum()
+    .reset_index()
+)
+
+plt.figure(figsize=(12,6))
+
+sns.lineplot(
+    data=monthly_year,
+    x="month",
+    y="Count",
+    hue="year",
+    palette="colorblind",
+    marker="o"
+)
+
+plt.title("Monthly Footfall Trends in Auckland CBD (2020–2024)")
+plt.xlabel("Month")
+plt.ylabel("Total Footfall")
+
+plt.xticks(
+    ticks=range(1,13),
+    labels=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+)
+
+# Force linear scale (just in case)
+plt.yscale("linear")
+
+# Format y-axis in millions
+plt.gca().yaxis.set_major_formatter(mtick.FuncFormatter(lambda x, _: f'{x/1e6:.1f}M'))
+
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+ped_long["footfall_level"] = ped_long["Count"].apply(footfall_level)
+
+ped_2020 = ped_long[ped_long["year"] == 2020]
+ped_2024 = ped_long[ped_long["year"] == 2024]
+
+dist_2020 = ped_2020["footfall_level"].value_counts(normalize=True) * 100
+dist_2024 = ped_2024["footfall_level"].value_counts(normalize=True) * 100
+
+print("2020 distribution (%):")
+print(dist_2020)
+
+print("\n2024 distribution (%):")
+print(dist_2024)
+
+compare_df = pd.DataFrame({
+    "2020": dist_2020,
+    "2024": dist_2024
+})
+
+compare_df.plot(kind="bar", figsize=(8,5), color=["#9999cc", "#ff9966"])
+plt.title("Distribution of Footfall Levels: 2020 vs 2024")
+plt.ylabel("Percentage of Observations (%)")
+plt.xticks(rotation=0)
+plt.grid(axis="y")
+plt.show()
+
+# Clean column names
+sensor_locations = sensor_locations.rename(columns={
+    "Address": "Location",
+    "Latitude": "lat",
+    "Longitude": "lon"
+})
+
+# Fix the typo so it matches your cleaned ped_long names
+sensor_locations["Location"] = sensor_locations["Location"].replace({
+    "59 High Stret": "59 High Street"
+})
+
+sensor_locations.head()
+
+# Drop rows with missing lat/lon 
+sensor_clean = sensor_locations.dropna(subset=["lat", "lon"]).copy()
+
+# Convert to GeoDataFrame 
+sensors_gdf = gpd.GeoDataFrame(
+    sensor_clean,
+    geometry=gpd.points_from_xy(sensor_clean["lon"], sensor_clean["lat"]),
+    crs="EPSG:4326"
+)
+
+sensors_gdf.head()
+sensor_locations.describe()
+
+#Convert to wide format
+sensor_year_wide = (
+    ped_long
+    .groupby(["Location", "year"])["Count"]
+    .sum()
+    .reset_index()
+    .pivot(index="Location", columns="year", values="Count")
+    .reset_index()
+)
+
+# Convert year columns to STRINGS (critical fix)
+sensor_year_wide = sensor_year_wide.rename(columns={
+    2020: "2020",
+    2021: "2021",
+    2022: "2022",
+    2023: "2023",
+    2024: "2024"
+})
+
+sensor_year_wide = compute_recovery(sensor_year_wide)
+# Merge into sensor GeoDataFrame
+sensors_recovery = sensors_gdf.merge(
+    sensor_year_wide[["Location", "2020", "2024", "pct_recovery"]],
+    on="Location",
+    how="left"
+).dropna(subset=["pct_recovery"])
+
+# Spatial join: assign each sensor to an SA2
+joined_sa2 = gpd.sjoin(
+    sensors_gdf,
+    sa2_2023_4326,
+    how="left",
+    predicate="within"
+)
+
+# Merge ped_long with SA2 info
+ped_sa2 = ped_long.merge(
+    joined_sa2[["Location", "SA22023_V1_00_NAME"]],
+    on="Location",
+    how="left"
+)
+
+# Total footfall per SA2 per year
+sa2_year = (
+    ped_sa2
+    .groupby(["SA22023_V1_00_NAME", "year"])["Count"]
+    .sum()
+    .reset_index()
+)
+
+# Pivot to wide format
+sa2_year_wide = sa2_year.pivot(
+    index="SA22023_V1_00_NAME",
+    columns="year",
+    values="Count"
+).reset_index()
+
+# Convert year columns to STRINGS (critical fix)
+sa2_year_wide = sa2_year_wide.rename(columns={
+    2020: "2020",
+    2021: "2021",
+    2022: "2022",
+    2023: "2023",
+    2024: "2024"
+})
+
+# Compute SA2 recovery
+sa2_year_wide = compute_recovery(sa2_year_wide)
+
+# Merge ALL year totals + recovery into SA2 polygons
+sa2_recovery = sa2_2023_4326.merge(
+    sa2_year_wide[
+        ["SA22023_V1_00_NAME", "2020", "2021", "2022", "2023", "2024", "pct_recovery"]
+    ],
+    on="SA22023_V1_00_NAME",
+    how="left"
+)
+
+# Remove SA2s with no recovery value
+sa2_recovery_clean = sa2_recovery.dropna(subset=["pct_recovery"]).copy()
+
+m = folium.Map(
+    location=[sensors_gdf["lat"].mean(), sensors_gdf["lon"].mean()],
+    zoom_start=15,
+    tiles="CartoDB Positron"
+)
+
+colormap = cm.linear.PuOr_11.scale(
+    sa2_recovery_clean["pct_recovery"].min(),
+    sa2_recovery_clean["pct_recovery"].max()
+)
+
+colormap.caption = "SA2 Footfall Recovery (2024 vs 2020)"
+colormap.add_to(m)
+
+tooltip = folium.GeoJsonTooltip(
+    fields=["SA22023_V1_00_NAME", "2020", "2021", "2022", "2023", "2024", "pct_recovery"],
+    aliases=["SA2:", "2020:", "2021:", "2022:", "2023:", "2024:", "Recovery (%):"],
+    localize=True
+)
+
+style_fn = lambda feature: {
+    "fillColor": colormap(float(feature["properties"]["pct_recovery"])),
+    "color": "#222222",      # darker outline for visibility
+    "weight": 0.4,           # thinner borders
+    "fillOpacity": 0.85,     # stronger fill
+}
+
+highlight_fn = lambda feature: {
+    "fillColor": colormap(float(feature["properties"]["pct_recovery"])),
+    "color": "black",
+    "weight": 2,
+    "fillOpacity": 0.95,
+}
+
+folium.GeoJson(
+    sa2_recovery_clean,
+    style_function=style_fn,
+    highlight_function=highlight_fn,
+    tooltip=tooltip
+).add_to(m)
+
+for _, row in sensors_recovery.iterrows():
+    folium.CircleMarker(
+        location=[row.lat, row.lon],
+        radius=6,
+        fill=True,
+        fill_color="black",
+        color="white",
+        weight=1,
+        tooltip=(
+            f"<b>{row['Location']}</b><br>"
+            f"2020 total: {row['2020']:,}<br>"
+            f"2024 total: {row['2024']:,}<br>"
+            f"Recovery: {row['pct_recovery']:.1f}%"
+        )
+    ).add_to(m)
+
+```
+
+``` {python}
+#| echo: false
+#| output: asis
+
+m._repr_html_()
+```
